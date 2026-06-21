@@ -5,6 +5,7 @@ class HandwritingRenderer {
         this.options = {
             text: '',
             fontFamily: '"KaiTi", "STKaiti", "楷体", serif',
+            styleName: 'kaishu',
             fontSize: 32,
             charSpacing: 2,
             lineHeight: 1.8,
@@ -17,13 +18,15 @@ class HandwritingRenderer {
             padding: 60,
             paperColor: '#faf8f0',
             inkColor: '#2c2c2c',
-            weight: 'normal'
+            weight: 'normal',
+            useMultilingual: true
         };
         this.pages = [];
         this.currentPage = 0;
         this.seed = Math.random();
         this._textLinesCache = null;
         this._cacheKey = '';
+        this._lineMetricsCache = null;
     }
 
     setOptions(options) {
@@ -31,6 +34,7 @@ class HandwritingRenderer {
         this.seed = Math.random();
         this._textLinesCache = null;
         this._cacheKey = '';
+        this._lineMetricsCache = null;
         PaperEffects.clearCache();
     }
 
@@ -43,12 +47,27 @@ class HandwritingRenderer {
     }
 
     splitTextIntoLines(text, maxWidth, ctx) {
-        const cacheKey = `${text}_${maxWidth}_${this.options.fontFamily}_${this.options.fontSize}_${this.options.charSpacing}_${this.options.weight}`;
+        const cacheKey = `${text}_${maxWidth}_${this.options.fontFamily}_${this.options.fontSize}_${this.options.charSpacing}_${this.options.weight}_${this.options.styleName}_${this.options.useMultilingual}`;
         
         if (this._textLinesCache && this._cacheKey === cacheKey) {
             return this._textLinesCache;
         }
+
+        if (!this.options.useMultilingual || typeof MultilingualProcessor === 'undefined') {
+            const lines = this._splitTextSimple(text, maxWidth, ctx);
+            this._textLinesCache = lines;
+            this._cacheKey = cacheKey;
+            return lines;
+        }
+
+        const lines = this._splitTextMultilingual(text, maxWidth, ctx);
+        this._textLinesCache = lines;
+        this._cacheKey = cacheKey;
         
+        return lines;
+    }
+
+    _splitTextSimple(text, maxWidth, ctx) {
         const paragraphs = text.split('\n');
         const lines = [];
         
@@ -56,7 +75,7 @@ class HandwritingRenderer {
         
         for (const paragraph of paragraphs) {
             if (paragraph === '') {
-                lines.push('');
+                lines.push({ segments: [], text: '', isMultilingual: false });
                 continue;
             }
             
@@ -68,7 +87,7 @@ class HandwritingRenderer {
                 const charWidth = ctx.measureText(char).width + this.options.charSpacing;
                 
                 if (currentWidth + charWidth > maxWidth && currentLine !== '') {
-                    lines.push(currentLine);
+                    lines.push({ segments: [{ text: currentLine, language: 'chinese' }], text: currentLine, isMultilingual: false });
                     currentLine = char;
                     currentWidth = charWidth;
                 } else {
@@ -78,35 +97,158 @@ class HandwritingRenderer {
             }
             
             if (currentLine !== '') {
-                lines.push(currentLine);
+                lines.push({ segments: [{ text: currentLine, language: 'chinese' }], text: currentLine, isMultilingual: false });
             }
         }
-        
-        this._textLinesCache = lines;
-        this._cacheKey = cacheKey;
         
         return lines;
     }
 
+    _splitTextMultilingual(text, maxWidth, ctx) {
+        const allSegments = MultilingualProcessor.segmentText(text);
+        const lines = [];
+        let currentLineSegments = [];
+        let currentLineWidth = 0;
+        let currentLineText = '';
+        let hasContent = false;
+
+        for (const segment of allSegments) {
+            if (segment.language === 'newline') {
+                lines.push({
+                    segments: currentLineSegments,
+                    text: currentLineText,
+                    isMultilingual: true,
+                    lineMetrics: null
+                });
+                currentLineSegments = [];
+                currentLineWidth = 0;
+                currentLineText = '';
+                hasContent = false;
+                continue;
+            }
+
+            const segmentMetrics = MultilingualProcessor.measureSegment(
+                ctx, segment, this.options.fontSize, this.options.charSpacing, this.options.styleName
+            );
+
+            if (currentLineWidth + segmentMetrics.width > maxWidth && hasContent) {
+                lines.push({
+                    segments: currentLineSegments,
+                    text: currentLineText,
+                    isMultilingual: true,
+                    lineMetrics: null
+                });
+                currentLineSegments = [{ ...segment, metrics: segmentMetrics }];
+                currentLineWidth = segmentMetrics.width;
+                currentLineText = segment.text;
+            } else {
+                currentLineSegments.push({ ...segment, metrics: segmentMetrics });
+                currentLineWidth += segmentMetrics.width;
+                currentLineText += segment.text;
+                hasContent = true;
+            }
+        }
+
+        if (currentLineSegments.length > 0 || !hasContent) {
+            lines.push({
+                segments: currentLineSegments,
+                text: currentLineText,
+                isMultilingual: true,
+                lineMetrics: null
+            });
+        }
+
+        for (const line of lines) {
+            if (line.segments.length > 0) {
+                line.lineMetrics = this._calculateLineMetrics(line.segments, ctx);
+            } else {
+                line.lineMetrics = {
+                    maxAscent: this.options.fontSize * 0.8,
+                    maxDescent: this.options.fontSize * 0.2,
+                    totalHeight: this.options.fontSize,
+                    totalWidth: 0,
+                    segmentMetrics: []
+                };
+            }
+        }
+
+        return lines;
+    }
+
+    _calculateLineMetrics(segmentsWithMetrics, ctx) {
+        const { fontSize, styleName, charSpacing } = this.options;
+        let maxAscent = 0;
+        let maxDescent = 0;
+        let totalWidth = 0;
+
+        for (const seg of segmentsWithMetrics) {
+            const metrics = seg.metrics || MultilingualProcessor.measureSegment(
+                ctx, seg, fontSize, charSpacing, styleName
+            );
+            
+            const effectiveAscent = metrics.ascent - metrics.baselineOffset;
+            const effectiveDescent = metrics.descent + metrics.baselineOffset;
+            
+            maxAscent = Math.max(maxAscent, effectiveAscent);
+            maxDescent = Math.max(maxDescent, effectiveDescent);
+            totalWidth += metrics.width;
+        }
+
+        return {
+            maxAscent,
+            maxDescent,
+            totalHeight: maxAscent + maxDescent,
+            totalWidth,
+            segmentMetrics: segmentsWithMetrics.map(s => ({
+                segment: s,
+                metrics: s.metrics
+            }))
+        };
+    }
+
     calculatePages() {
-        const { pageWidth, pageHeight, padding, lineHeight, fontSize } = this.options;
+        const { pageWidth, pageHeight, padding, lineHeight, fontSize, useMultilingual } = this.options;
         const contentWidth = pageWidth - padding * 2;
         const contentHeight = pageHeight - padding * 2;
-        const lineHeightPx = fontSize * lineHeight;
+        const defaultLineHeightPx = fontSize * lineHeight;
         
         const tempCanvas = document.createElement('canvas');
         const tempCtx = tempCanvas.getContext('2d');
         
         const lines = this.splitTextIntoLines(this.options.text, contentWidth, tempCtx);
-        const linesPerPage = Math.floor(contentHeight / lineHeightPx);
         
-        const pages = [];
-        for (let i = 0; i < lines.length; i += linesPerPage) {
-            pages.push(lines.slice(i, i + linesPerPage));
+        if (!useMultilingual || typeof MultilingualProcessor === 'undefined') {
+            const linesPerPage = Math.floor(contentHeight / defaultLineHeightPx);
+            const pages = [];
+            for (let i = 0; i < lines.length; i += linesPerPage) {
+                pages.push(lines.slice(i, i + linesPerPage));
+            }
+            if (pages.length === 0) {
+                pages.push([]);
+            }
+            return pages;
         }
         
-        if (pages.length === 0) {
-            pages.push([]);
+        const pages = [];
+        let currentPageLines = [];
+        let currentPageHeight = 0;
+        
+        for (const line of lines) {
+            const lineMetrics = line.lineMetrics || { totalHeight: defaultLineHeightPx };
+            const lineActualHeight = Math.max(lineMetrics.totalHeight * lineHeight, defaultLineHeightPx);
+            
+            if (currentPageHeight + lineActualHeight > contentHeight && currentPageLines.length > 0) {
+                pages.push(currentPageLines);
+                currentPageLines = [line];
+                currentPageHeight = lineActualHeight;
+            } else {
+                currentPageLines.push(line);
+                currentPageHeight += lineActualHeight;
+            }
+        }
+        
+        if (currentPageLines.length > 0 || pages.length === 0) {
+            pages.push(currentPageLines);
         }
         
         return pages;
@@ -115,7 +257,7 @@ class HandwritingRenderer {
     renderPage(pageIndex) {
         const { pageWidth, pageHeight, padding, fontSize, lineHeight, charSpacing,
                 paperColor, inkColor, fontFamily, weight, slantAngle, inkDensity,
-                randomOffset, strokeNoise } = this.options;
+                randomOffset, strokeNoise, styleName, useMultilingual } = this.options;
         
         this.canvas.width = pageWidth;
         this.canvas.height = pageHeight;
@@ -134,47 +276,138 @@ class HandwritingRenderer {
         this.currentPage = pageIndex;
         
         const pageLines = pages[pageIndex];
-        const lineHeightPx = fontSize * lineHeight;
+        const defaultLineHeightPx = fontSize * lineHeight;
         const startY = padding;
         
         let charIndexOffset = 0;
         for (let i = 0; i < pageIndex; i++) {
-            charIndexOffset += pages[i].reduce((sum, line) => sum + line.length, 0);
+            charIndexOffset += pages[i].reduce((sum, line) => sum + this._getLineCharCount(line), 0);
         }
         
         let charCount = 0;
-        ctx.font = `${weight} ${fontSize}px ${fontFamily}`;
+        let currentY = startY;
         
-        for (let lineIndex = 0; lineIndex < pageLines.length; lineIndex++) {
-            const line = pageLines[lineIndex];
-            const y = startY + lineIndex * lineHeightPx;
-            let x = padding;
+        if (useMultilingual && typeof MultilingualProcessor !== 'undefined') {
+            for (let lineIndex = 0; lineIndex < pageLines.length; lineIndex++) {
+                const line = pageLines[lineIndex];
+                const lineMetrics = line.lineMetrics || { totalHeight: fontSize, maxAscent: fontSize * 0.8 };
+                const lineActualHeight = Math.max(lineMetrics.totalHeight * lineHeight, defaultLineHeightPx);
+                
+                const baselineY = currentY + lineMetrics.maxAscent;
+                let x = padding;
+                
+                if (line.segments && line.segments.length > 0) {
+                    for (const segment of line.segments) {
+                        const segMetrics = segment.metrics || MultilingualProcessor.measureSegment(
+                            ctx, segment, fontSize, charSpacing, styleName
+                        );
+                        
+                        const baselineAdjust = MultilingualProcessor.getBaselineAdjustment(
+                            { metrics: segMetrics },
+                            lineMetrics.maxAscent
+                        );
+                        
+                        const segY = baselineY + baselineAdjust - segMetrics.ascent + segMetrics.baselineOffset;
+                        
+                        charCount = this._drawSegment(ctx, segment, x, segY, {
+                            charIndexOffset,
+                            charCount,
+                            lineIndex,
+                            fontSize,
+                            charSpacing,
+                            slantAngle,
+                            inkColor,
+                            inkDensity,
+                            randomOffset,
+                            strokeNoise,
+                            styleName
+                        });
+                        
+                        x += segMetrics.width;
+                    }
+                }
+                
+                currentY += lineActualHeight;
+            }
+        } else {
+            ctx.font = `${weight} ${fontSize}px ${fontFamily}`;
             
-            for (let charIndex = 0; charIndex < line.length; charIndex++) {
-                const char = line[charIndex];
-                const globalCharIndex = charIndexOffset + charCount;
+            for (let lineIndex = 0; lineIndex < pageLines.length; lineIndex++) {
+                const line = pageLines[lineIndex];
+                const lineText = line.text || '';
+                const y = startY + lineIndex * defaultLineHeightPx;
+                let x = padding;
                 
-                TextEffects.drawChar(ctx, char, x, y, {
-                    charIndex: globalCharIndex,
-                    lineIndex,
-                    seed: this.seed,
-                    fontSize,
-                    fontFamily,
-                    weight,
-                    slantAngle,
-                    inkColor,
-                    inkDensity,
-                    randomOffset,
-                    strokeNoise
-                });
-                
-                const charWidth = ctx.measureText(char).width + charSpacing;
-                x += charWidth;
-                charCount++;
+                for (let charIndex = 0; charIndex < lineText.length; charIndex++) {
+                    const char = lineText[charIndex];
+                    const globalCharIndex = charIndexOffset + charCount;
+                    
+                    TextEffects.drawChar(ctx, char, x, y, {
+                        charIndex: globalCharIndex,
+                        lineIndex,
+                        seed: this.seed,
+                        fontSize,
+                        fontFamily,
+                        weight,
+                        slantAngle,
+                        inkColor,
+                        inkDensity,
+                        randomOffset,
+                        strokeNoise
+                    });
+                    
+                    const charWidth = ctx.measureText(char).width + charSpacing;
+                    x += charWidth;
+                    charCount++;
+                }
             }
         }
         
         return pages.length;
+    }
+
+    _getLineCharCount(line) {
+        if (line.segments) {
+            return line.segments.reduce((sum, seg) => sum + seg.text.length, 0);
+        }
+        return (line.text || '').length;
+    }
+
+    _drawSegment(ctx, segment, x, y, options) {
+        const { charIndexOffset, charCount, lineIndex, fontSize, charSpacing,
+                slantAngle, inkColor, inkDensity, randomOffset, strokeNoise, styleName } = options;
+        
+        const fontConfig = MultilingualProcessor.getFontConfig(segment.language, styleName);
+        const actualFontSize = fontSize * fontConfig.fontSizeScale;
+        
+        let currentX = x;
+        let currentCharCount = charCount;
+        
+        for (let i = 0; i < segment.text.length; i++) {
+            const char = segment.text[i];
+            const globalCharIndex = charIndexOffset + currentCharCount;
+            
+            TextEffects.drawChar(ctx, char, currentX, y, {
+                charIndex: globalCharIndex,
+                lineIndex,
+                seed: this.seed,
+                fontSize: actualFontSize,
+                fontFamily: fontConfig.fontFamily,
+                weight: fontConfig.weight,
+                slantAngle,
+                inkColor,
+                inkDensity,
+                randomOffset,
+                strokeNoise
+            });
+            
+            ctx.font = `${fontConfig.weight} ${actualFontSize}px ${fontConfig.fontFamily}`;
+            const charWidth = ctx.measureText(char).width + charSpacing;
+            currentX += charWidth;
+            currentCharCount++;
+        }
+        
+        return currentCharCount;
     }
 
     generateAllPages() {

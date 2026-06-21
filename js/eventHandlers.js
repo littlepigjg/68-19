@@ -29,6 +29,8 @@ class EventHandlers {
         delete options.description;
         delete options.fontKey;
         
+        options.styleName = styleName;
+        
         if (style.fontKey && style.fontKey !== 'custom') {
             await FontLoader.loadGoogleFont(style.fontKey);
             options.fontFamily = FontLoader.getFontFamily(style.fontKey);

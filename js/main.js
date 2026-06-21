@@ -24,6 +24,15 @@ class HandwritingApp {
             console.warn('预加载字体失败:', error);
         }
         
+        try {
+            if (typeof MultilingualProcessor !== 'undefined') {
+                await MultilingualProcessor.loadMultilingualFonts();
+                console.log('多语言字体加载完成');
+            }
+        } catch (error) {
+            console.warn('多语言字体加载失败:', error);
+        }
+        
         this.eventHandlers.bindAll();
         await this.eventHandlers.applyStyle('kaishu');
         this.generatePreview();
